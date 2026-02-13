@@ -1,6 +1,6 @@
 """
 BB84 Quantum Chat - Main UI Controller
-Renders the header, chat messages, status bar, and input prompt.
+IRC-style interface: clean message flow, compact system messages, minimal panels.
 """
 
 from rich.console import Console
@@ -23,7 +23,7 @@ def create_console() -> Console:
 
 def display_header(console: Console, role: str, peer: str, key_manager: KeyManager,
                    stats: Statistics):
-    """Display the top header bar."""
+    """Display a compact IRC-style header bar."""
     key = key_manager.get_key()
     key_len = key.length if key else 0
     key_usage = f"{key.usage_percentage():.0f}%" if key else "N/A"
@@ -32,70 +32,54 @@ def display_header(console: Console, role: str, peer: str, key_manager: KeyManag
     sec_status = stats.security_status()
     sec_sym = SYMBOLS['secure'] if sec_status == "SECURE" else SYMBOLS['compromised']
 
-    header = (
-        f"     BB84 QUANTUM SECURE CHAT — {role} connected to {peer}\n"
-        f"     Key: {key_len} bits ({key_usage} used) | "
-        f"Encrypted: {msg_count} msgs | "
-        f"Error Rate: {error_rate:.1%} | "
-        f"{sec_sym} {sec_status}"
-    )
-
-    console.print(Panel(
-        f"[bold bright_white]{header}[/]",
-        box=box.DOUBLE,
-        style="blue",
-        expand=True,
-    ))
+    console.print(f"[bold bright_cyan]─── BB84 Quantum Chat ───[/] "
+                  f"[dim]Key:{key_len}b ({key_usage}) │ Msgs:{msg_count} │ "
+                  f"Err:{error_rate:.1%} │ {sec_sym} {sec_status}[/]")
+    console.print()
 
 
 def display_message(console: Console, msg: Message, show_encrypted: bool = True):
-    """Display a single chat message."""
-    sender_style = "alice" if msg.sender.lower() == "alice" else "bob"
+    """Display a message in IRC format: <Sender> message"""
     time_str = msg.time_str()
+    sender = msg.sender
+    style = "bold cyan" if sender.lower() == "alice" else "bold green"
 
-    console.print(f"  [{sender_style}][{time_str}] {msg.sender}:[/] {msg.content}")
+    console.print(f"[dim]{time_str}[/] [{style}]<{sender}>[/] {msg.content}")
     if show_encrypted and msg.encrypted:
-        console.print(f"             [encrypted][ENCRYPTED] {msg.encrypted}[/]")
+        console.print(f"         [dim]│ {SYMBOLS['lock']} {msg.encrypted}[/]")
 
 
 def display_system_message(console: Console, text: str, level: str = "INFO"):
-    """Display a system message."""
+    """Display a system message with IRC-style prefix."""
     from datetime import datetime
     time_str = datetime.now().strftime('%H:%M:%S')
-    style_map = {
-        'INFO': 'system',
-        'WARNING': 'warning',
-        'ERROR': 'error',
-        'SUCCESS': 'success',
+
+    prefixes = {
+        'INFO':    ('[dim]', '---'),
+        'WARNING': ('[bold yellow]', '⚠ '),
+        'ERROR':   ('[bold red]', '!!!'),
+        'SUCCESS': ('[bold green]', '>>>'),
     }
-    style = style_map.get(level, 'system')
-    console.print(f"  [{style}][{time_str}] [{level}] {text}[/]")
+    style, prefix = prefixes.get(level, ('[dim]', '---'))
+    console.print(f"[dim]{time_str}[/] {style}{prefix} {text}[/]")
 
 
 def display_status_bar(console: Console, key_manager: KeyManager, stats: Statistics):
-    """Display the status bar with key usage gauge."""
+    """Display a compact one-line status bar."""
     key = key_manager.get_key()
     if key:
         usage_pct = key.usage_percentage()
-        bar_len = 30
+        bar_len = 20
         filled = int(bar_len * usage_pct / 100)
         bar = '█' * filled + '░' * (bar_len - filled)
         rotation_age = int(key.age_seconds())
-        age_str = f"{rotation_age // 60} min ago" if rotation_age >= 60 else f"{rotation_age}s ago"
+        age_str = f"{rotation_age // 60}m" if rotation_age >= 60 else f"{rotation_age}s"
 
-        status = (
-            f"[info]Connection secure[/] | Last key rotation: {age_str}\n"
-            f"  Key Usage: [{bar}] {usage_pct:.0f}% ({key.bits_used}/{key.length} bits)"
-        )
+        console.print(f"[dim]─── Key:[/] [{bar}] [dim]{usage_pct:.0f}% "
+                      f"({key.bits_used}/{key.length}b) │ Age: {age_str} ───[/]")
     else:
-        status = "[warning]No encryption key established. Use /refresh to generate.[/]"
-
-    console.print(Panel(
-        f"  {status}",
-        title="[bold]STATUS[/]",
-        box=box.ROUNDED,
-        style="dim",
-    ))
+        console.print("[dim]─── No key. Type /refresh to generate. ───[/]")
+    console.print()
 
 
 def display_key_info(console: Console, key_manager: KeyManager):
@@ -110,43 +94,37 @@ def display_key_info(console: Console, key_manager: KeyManager):
     if len(key.bits) > 32:
         key_binary += ' ...'
 
-    text = Text()
-    text.append(f"\n  Key ID:       #{key.id}\n")
-    text.append(f"  Length:       {key.length} bits\n")
-    text.append(f"  Generated:    {int(key.age_seconds())}s ago\n")
-    text.append(f"  Error Rate:   {key.error_rate:.1%}\n\n")
-    text.append(f"  Binary:       {key_binary}\n")
-    text.append(f"  Hex:          {key_hex}\n\n")
-    text.append(f"  Used:         {key.bits_used}/{key.length} ({key.usage_percentage():.0f}%)\n")
-    text.append(f"  Remaining:    {key.remaining()} bits\n")
-
-    console.print(Panel(text, title="[bold magenta]ENCRYPTION KEY[/]", box=box.ROUNDED, style="magenta"))
+    console.print(f"[dim]───────── Encryption Key ─────────[/]")
+    console.print(f"  [bold magenta]ID:[/]        #{key.id}")
+    console.print(f"  [bold magenta]Length:[/]    {key.length} bits")
+    console.print(f"  [bold magenta]Age:[/]       {int(key.age_seconds())}s")
+    console.print(f"  [bold magenta]Error:[/]     {key.error_rate:.1%}")
+    console.print(f"  [bold magenta]Hex:[/]       {key_hex}")
+    console.print(f"  [bold magenta]Used:[/]      {key.bits_used}/{key.length} ({key.usage_percentage():.0f}%)")
+    console.print(f"  [bold magenta]Remaining:[/] {key.remaining()} bits")
+    console.print(f"[dim]──────────────────────────────────[/]")
 
 
 def display_chat_history(console: Console, history: ChatHistory, show_encrypted: bool = True):
     """Display all messages in history."""
     messages = history.get_all()
     if not messages:
-        console.print("  [dim]No messages yet. Start typing![/]")
+        display_system_message(console, "No messages yet.", "INFO")
         return
 
+    console.print(f"[dim]─── Message History ({len(messages)} messages) ───[/]")
     for msg in messages:
         display_message(console, msg, show_encrypted)
+    console.print(f"[dim]─── End of History ───[/]")
 
 
 def display_welcome(console: Console, role: str):
-    """Display the welcome screen."""
-    welcome = Text()
-    welcome.append("\n")
-    welcome.append("  ╔══════════════════════════════════════════════════╗\n", style="bright_cyan")
-    welcome.append("  ║                                                  ║\n", style="bright_cyan")
-    welcome.append("  ║     BB84 QUANTUM SECURE CHAT                    ║\n", style="bold bright_white")
-    welcome.append("  ║                                                  ║\n", style="bright_cyan")
-    welcome.append("  ║     Quantum Key Distribution Protocol            ║\n", style="bright_cyan")
-    welcome.append("  ║     Secure • Encrypted • Quantum-Safe            ║\n", style="bright_cyan")
-    welcome.append("  ║                                                  ║\n", style="bright_cyan")
-    welcome.append("  ╚══════════════════════════════════════════════════╝\n", style="bright_cyan")
-    welcome.append(f"\n  Running as: [bold]{role}[/]\n")
-    welcome.append(f"  Type /help for commands\n\n")
-
-    console.print(welcome)
+    """Display a compact IRC-style welcome banner."""
+    console.print()
+    console.print("[bold bright_cyan]╔══════════════════════════════════════════════╗[/]")
+    console.print("[bold bright_cyan]║[/]  [bold bright_white]BB84 QUANTUM SECURE CHAT[/]                   [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]  [dim]Quantum Key Distribution • XOR Encryption[/] [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]╚══════════════════════════════════════════════╝[/]")
+    console.print()
+    console.print(f"  [dim]Role:[/] [bold]{role}[/]  [dim]│  Type[/] [bold]/help[/] [dim]for commands[/]")
+    console.print()

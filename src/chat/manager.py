@@ -46,7 +46,7 @@ class ChatManager:
         self.stats = Statistics()
         self.eve = Eve()
         self.eve_active = False
-        self.verbose = True
+        self.verbose = False
         self.running = True
         self._lock = threading.Lock()
         self.peer_address = ""
