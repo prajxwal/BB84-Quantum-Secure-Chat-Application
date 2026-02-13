@@ -50,12 +50,18 @@ class ChatManager:
         self.running = True
         self._lock = threading.Lock()
         self.peer_address = ""
+        self._key_ready = threading.Event()  # signals when a key has been set
 
     # ─── BB84 Key Exchange ──────────────────────────────────────
 
     def perform_key_exchange(self, animate: bool = True):
-        """Perform a BB84 key exchange (local simulation shared by both peers)."""
+        """
+        Generate a BB84 key locally, set it, and send it to the peer.
+        Only the caller of this method generates. The peer receives via
+        _handle_key_sync instead of running its own bb84_simulate.
+        """
         display_system_message(self.console, "Initiating BB84 key exchange...", "INFO")
+        self._key_ready.clear()
         start_time = time.time()
 
         result = bb84_simulate(
@@ -81,7 +87,6 @@ class ChatManager:
                 "ERROR"
             )
             display_system_message(self.console, "Establishing new secure channel...", "INFO")
-            # Retry without Eve active for the fresh key
             self.eve_active = False
             self.stats.eve_active = False
             self.perform_key_exchange(animate=False)
@@ -96,19 +101,18 @@ class ChatManager:
             self.perform_key_exchange(animate=False)
             return
 
-        # Set the new key
+        # Set the new key locally
         key = self.key_manager.set_key(result['alice_final_key'], result['error_rate'])
+        self._key_ready.set()
 
-        # Sync key with peer — send our key data so both sides have the same key
-        # In a real quantum system the key is derived independently at each end.
-        # For this simulation, we send the key over the classical channel after BB84.
+        # Send the same key to the peer so both sides share it
         try:
             self.network.send(MSG_BB84_COMPLETE, {
                 'key': result['alice_final_key'],
                 'error_rate': result['error_rate'],
             })
         except Exception:
-            pass  # peer will also have run its own simulation
+            pass
 
         # Record stats
         self.stats.record_key_exchange(
@@ -125,6 +129,16 @@ class ChatManager:
             f"Secure key established: {key.length} bits (#{key.id})",
             "SUCCESS"
         )
+
+    def wait_for_peer_key(self, timeout: float = 30.0):
+        """
+        Wait for the peer to send us a key (used by Bob on startup).
+        Bob does NOT generate his own key — he waits for Alice's.
+        """
+        display_system_message(self.console, "Waiting for peer to send key...", "INFO")
+        got_it = self._key_ready.wait(timeout=timeout)
+        if not got_it:
+            display_system_message(self.console, "Timed out waiting for key. Use /refresh.", "WARNING")
 
     # ─── Message Handling ───────────────────────────────────────
 
@@ -193,8 +207,8 @@ class ChatManager:
                 display_system_message(self.console, "Peer disconnected.", "WARNING")
                 self.running = False
             elif msg_type == MSG_KEY_ROTATE:
-                display_system_message(self.console, "Peer requested key refresh.", "INFO")
-                self.perform_key_exchange(animate=True)
+                # Peer is generating a new key; we just wait for MSG_BB84_COMPLETE
+                display_system_message(self.console, "Peer is refreshing key. Waiting...", "INFO")
 
     def _handle_chat(self, payload: dict):
         """Handle incoming chat message."""
@@ -221,14 +235,15 @@ class ChatManager:
         self.stats.record_message_received(len(plaintext.encode('utf-8')))
 
     def _handle_key_sync(self, payload: dict):
-        """Handle key synchronization from peer."""
+        """Handle key received from peer — set it as our own key."""
         key_bits = payload.get('key', [])
         error_rate = payload.get('error_rate', 0.0)
         if key_bits:
             self.key_manager.set_key(key_bits, error_rate)
+            self._key_ready.set()
             display_system_message(
                 self.console,
-                f"Key synchronized from peer: {len(key_bits)} bits",
+                f"Secure key received from peer: {len(key_bits)} bits",
                 "SUCCESS"
             )
 
@@ -254,6 +269,7 @@ class ChatManager:
                 self.network.send(MSG_KEY_ROTATE, {})
             except Exception:
                 pass
+            # This side generates the new key and sends it to peer
             self.perform_key_exchange(animate=True)
 
         elif command == '/stats':
@@ -326,11 +342,15 @@ class ChatManager:
         display_welcome(self.console, self.role)
         self.stats.mark_connected()
 
-        # Perform initial key exchange
-        self.perform_key_exchange(animate=True)
-
-        # Start receiving thread
+        # Start receiving thread FIRST so we can receive the peer's key
         self.network.start_receiving(self.handle_received_message)
+
+        # Key exchange: Alice generates and sends, Bob waits to receive
+        if self.role == "Alice":
+            self.perform_key_exchange(animate=True)
+        else:
+            # Bob waits for Alice to send the key
+            self.wait_for_peer_key(timeout=30.0)
 
         # Display header and status
         display_header(self.console, self.role, self.peer, self.key_manager, self.stats)
