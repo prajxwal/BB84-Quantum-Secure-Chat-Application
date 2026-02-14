@@ -13,10 +13,11 @@ RETRY_BACKOFF = [1, 2, 4]  # seconds
 
 # ─── BB84 Protocol ──────────────────────────────────────────────
 NUM_PHOTONS = 256           # Photons per key exchange (more = longer key)
-MIN_KEY_LENGTH = 32         # Minimum acceptable key length (bits)
+INTERACTIVE_NUM_PHOTONS = 16  # Photons for interactive mode (manual entry)
+MIN_KEY_LENGTH = 2          # Minimum acceptable key length (bits) — low for interactive
 MAX_KEY_LENGTH = 128        # Maximum key length to retain
 ERROR_THRESHOLD = 0.10      # 10% error rate triggers eavesdropper alert
-SAMPLE_FRACTION = 0.10      # Fraction of key bits to sample for error check
+SAMPLE_FRACTION = 0.25      # Fraction of key bits to sample for error check
 
 # ─── Key Management ────────────────────────────────────────────
 KEY_ROTATION_THRESHOLD = 0.75   # Rotate at 75% usage

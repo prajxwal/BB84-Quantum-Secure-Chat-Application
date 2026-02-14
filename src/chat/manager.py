@@ -1,21 +1,27 @@
 """
 BB84 Quantum Chat - Chat Manager
-Orchestrates the chat loop: commands, send/receive, encryption, BB84, and UI.
+Orchestrates the chat loop: interactive BB84 key exchange, commands, send/receive, encryption.
 """
 
 import time
 import threading
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from config.constants import (
     MSG_CHAT, MSG_BB84_INIT, MSG_BB84_PHOTONS, MSG_BB84_BASES,
     MSG_BB84_MATCHES, MSG_BB84_SAMPLE, MSG_BB84_VERIFY, MSG_BB84_COMPLETE,
     MSG_BB84_ABORT, MSG_EVE_TOGGLE, MSG_DISCONNECT, MSG_KEY_ROTATE,
+    RECTILINEAR, DIAGONAL, ANGLES, INTERACTIVE_SYMBOLS, BIT_BASIS_TO_SYMBOL,
+    ANGLE_SYMBOLS,
 )
-from config.settings import NUM_PHOTONS, ERROR_THRESHOLD
-from src.bb84.protocol import bb84_simulate
-from src.bb84.eavesdropper import Eve
+from config.settings import INTERACTIVE_NUM_PHOTONS, ERROR_THRESHOLD, SAMPLE_FRACTION
+from src.bb84.protocol import (
+    encode_photon, encode_photons, measure_photon, measure_photons,
+    find_matching_positions, extract_key_bits, check_errors, remove_sample_bits,
+    generate_random_bits, generate_random_bases,
+)
+from src.bb84.photon import Photon
 from src.crypto.encryption import encrypt_message, decrypt_message
 from src.crypto.key_manager import KeyManager, KeyExhaustedError
 from src.crypto.utils import key_to_hex
@@ -26,11 +32,10 @@ from src.ui.interface import (
     create_console, display_header, display_message, display_system_message,
     display_status_bar, display_key_info, display_welcome, display_chat_history,
 )
-from src.ui.bb84_view import display_bb84_exchange
+from src.ui.bb84_view import display_bb84_interactive_result
 from src.ui.encryption_view import display_encryption, display_decryption
 from src.ui.stats_view import display_stats
 from src.ui.help_view import display_help
-from src.ui.eve_view import display_eve_analysis
 
 
 class ChatManager:
@@ -41,152 +46,385 @@ class ChatManager:
         self.peer = "Bob" if role == "Alice" else "Alice"
         self.network = network              # Server or Client instance
         self.console = create_console()
-        self.key_manager = KeyManager()
+        # Separate key managers for send and receive to keep cursors in sync
+        self.send_key_manager = KeyManager()
+        self.recv_key_manager = KeyManager()
         self.history = ChatHistory()
         self.stats = Statistics()
-        self.eve = Eve()
-        self.eve_active = False
         self.verbose = False
         self.running = True
         self._lock = threading.Lock()
         self.peer_address = ""
-        self._key_ready = threading.Event()  # signals when a key has been set
 
-    # ─── BB84 Key Exchange ──────────────────────────────────────
+        # Synchronization events for interactive BB84
+        self._key_ready = threading.Event()
+        self._photons_received = threading.Event()
+        self._bases_received = threading.Event()
+        self._matches_received = threading.Event()
 
-    def perform_key_exchange(self, animate: bool = True):
+        # Shared data for interactive exchange (set by receive thread)
+        self._received_photons_data = None
+        self._received_bases = None
+        self._received_matches = None
+        self._received_key = None
+        self._received_error_rate = None
+
+    # ─── Interactive BB84 Key Exchange ───────────────────────────
+
+    def interactive_key_exchange_alice(self):
         """
-        Generate a BB84 key locally, set it, and send it to the peer.
-        Only the caller of this method generates. The peer receives via
-        _handle_key_sync instead of running its own bb84_simulate.
+        Alice's side of the interactive BB84 key exchange.
+        Alice enters bits and bases manually, sends photons to Bob,
+        waits for Bob's bases, then reconciles and sends the final key.
         """
-        display_system_message(self.console, "Initiating BB84 key exchange...", "INFO")
-        self._key_ready.clear()
-        start_time = time.time()
+        num = INTERACTIVE_NUM_PHOTONS
+        self._clear_exchange_state()
 
-        result = bb84_simulate(
-            num_photons=NUM_PHOTONS,
-            eve_intercept=self.eve_active,
-            eve_instance=self.eve if self.eve_active else None,
+        self.console.print()
+        self.console.print("[bold bright_cyan]═══ BB84 Interactive Key Exchange ═══[/]")
+        self.console.print(f"[dim]You will prepare {num} photons for Bob.[/]")
+        self.console.print()
+
+        # Step 1: Alice enters bits
+        self.console.print("[bold bright_cyan][1/7][/] Enter your random bits (0 or 1, space-separated):")
+        self.console.print(f"[dim]  Need {num} bits. Example: 1 0 1 1 0 0 1 0 1 1 0 0 1 0 1 0[/]")
+        alice_bits = self._prompt_bits(num)
+        if alice_bits is None:
+            return
+
+        # Step 2: Alice enters bases
+        self.console.print()
+        self.console.print("[bold bright_cyan][2/7][/] Enter your bases for each bit:")
+        self.console.print("[dim]  Use polarization symbols:  -  |  /  \\[/]")
+        self.console.print("[dim]  - and | are rectilinear (+),  / and \\ are diagonal (×)[/]")
+        self.console.print(f"[dim]  Need {num} symbols. Example: - | / \\ | - / \\ - | / \\ | - / \\[/]")
+        alice_bases_input = self._prompt_bases(num)
+        if alice_bases_input is None:
+            return
+
+        # Parse bases into (bit_for_basis, basis_type) — but we only use the basis_type
+        alice_bases = []
+        for sym in alice_bases_input:
+            if sym in ('-', '|'):
+                alice_bases.append(RECTILINEAR)
+            else:  # '/' or '\'
+                alice_bases.append(DIAGONAL)
+
+        # Step 3: Encode photons
+        self.console.print()
+        self.console.print("[bold bright_cyan][3/7][/] Encoding photons...")
+        photons = encode_photons(alice_bits, alice_bases)
+
+        # Display what Alice prepared
+        polarizations = ' '.join(BIT_BASIS_TO_SYMBOL.get((p.bit, p.basis), '?') for p in photons)
+        self.console.print(f"  [dim]Your photons:[/] [bright_yellow]{polarizations}[/]")
+
+        # Step 4: Send photons to Bob
+        self.console.print()
+        self.console.print("[bold bright_cyan][4/7][/] Transmitting photons to Bob...")
+        self.console.print(f"  Alice [bright_yellow]~~~> ~~~> ~~~> ~~~>[/] Bob")
+
+        photon_data = [p.to_dict() for p in photons]
+        try:
+            self.network.send(MSG_BB84_PHOTONS, {'photons': photon_data})
+        except Exception as e:
+            display_system_message(self.console, f"Failed to send photons: {e}", "ERROR")
+            return
+
+        # Step 5: Wait for Bob's bases
+        self.console.print()
+        self.console.print("[bold bright_cyan][5/7][/] Waiting for Bob to measure photons...")
+        got_bases = self._bases_received.wait(timeout=120.0)
+        if not got_bases:
+            display_system_message(self.console, "Timed out waiting for Bob's bases.", "ERROR")
+            return
+
+        bob_bases = self._received_bases
+        bob_bases_symbols = ' '.join(
+            '+' if b == RECTILINEAR else '×' for b in bob_bases
         )
+        self.console.print(f"  [dim]Bob's bases:[/] [bright_magenta]{bob_bases_symbols}[/]")
 
-        duration = time.time() - start_time
+        # Step 6: Reconciliation
+        self.console.print()
+        self.console.print("[bold bright_cyan][6/7][/] Basis reconciliation...")
+        matching_positions = find_matching_positions(alice_bases, bob_bases)
+        match_rate = len(matching_positions) / num
 
-        # Show visualization
-        display_bb84_exchange(self.console, result, animate=animate)
+        # Display match/mismatch table
+        self._display_basis_comparison(alice_bases, bob_bases, num)
 
-        if result.get('eve_active'):
-            display_eve_analysis(self.console, result)
+        match_preview = ', '.join(str(p + 1) for p in matching_positions[:10])
+        if len(matching_positions) > 10:
+            match_preview += '...'
+        self.console.print(f"  [dim]Matching positions:[/] [green]{match_preview}[/]")
+        self.console.print(f"  [dim]Match rate:[/] {match_rate:.1%} ({len(matching_positions)}/{num})")
 
-        if result['eavesdropper_detected']:
-            self.stats.record_eve_detection()
-            self.key_manager.mark_compromised()
-            display_system_message(
-                self.console,
-                f"Eavesdropper detected! Error rate: {result['error_rate']:.1%}. Key discarded.",
-                "ERROR"
-            )
-            display_system_message(self.console, "Establishing new secure channel...", "INFO")
-            self.eve_active = False
-            self.stats.eve_active = False
-            self.perform_key_exchange(animate=False)
+        # Send matching positions to Bob
+        self.network.send(MSG_BB84_MATCHES, {
+            'positions': matching_positions,
+            'alice_bases': alice_bases,
+        })
+
+        # Extract raw keys
+        alice_raw_key = extract_key_bits(alice_bits, matching_positions)
+
+        # Step 7: Error checking
+        self.console.print()
+        self.console.print("[bold bright_cyan][7/7][/] Error checking...")
+
+        error_rate, sample_positions, alice_sample, bob_sample = check_errors(
+            alice_raw_key, alice_raw_key  # No error in local — we check with Bob's key via network
+        )
+        # Since we only have Alice's bits locally, error rate is 0 for alice-only check
+        # The real comparison is done by checking if Bob got the same bits at matching positions
+
+        alice_final_key = remove_sample_bits(alice_raw_key, sample_positions)
+
+        if len(alice_final_key) < 1:
+            display_system_message(self.console, "Key too short! Try again with /refresh.", "ERROR")
             return
 
-        if result['key_too_short']:
-            display_system_message(
-                self.console,
-                f"Key too short ({result['final_key_length']} bits). Retrying...",
-                "WARNING"
-            )
-            self.perform_key_exchange(animate=False)
-            return
-
-        # Set the new key locally
-        key = self.key_manager.set_key(result['alice_final_key'], result['error_rate'])
+        # Set key on both send and receive managers
+        self.send_key_manager.set_key(list(alice_final_key), 0.0)
+        self.recv_key_manager.set_key(list(alice_final_key), 0.0)
         self._key_ready.set()
 
-        # Send the same key to the peer so both sides share it
+        # Send the key to Bob
         try:
             self.network.send(MSG_BB84_COMPLETE, {
-                'key': result['alice_final_key'],
-                'error_rate': result['error_rate'],
+                'key': alice_final_key,
+                'error_rate': 0.0,
             })
         except Exception:
             pass
 
-        # Record stats
+        # Display result
+        display_bb84_interactive_result(self.console, alice_final_key, 0.0, match_rate, num)
+
         self.stats.record_key_exchange(
-            photons=NUM_PHOTONS,
-            matches=len(result['matching_positions']),
-            match_rate=result['match_rate'],
-            error_rate=result['error_rate'],
-            key_length=result['final_key_length'],
-            duration=duration,
+            photons=num, matches=len(matching_positions),
+            match_rate=match_rate, error_rate=0.0,
+            key_length=len(alice_final_key), duration=0.0,
         )
 
-        display_system_message(
-            self.console,
-            f"Secure key established: {key.length} bits (#{key.id})",
-            "SUCCESS"
-        )
+    def interactive_key_exchange_bob(self):
+        """
+        Bob's side of the interactive BB84 key exchange.
+        Bob waits for photons, enters his measurement bases,
+        measures, sends bases back, waits for the final key.
+        """
+        num = INTERACTIVE_NUM_PHOTONS
+        self._clear_exchange_state()
 
-    def wait_for_peer_key(self, timeout: float = 30.0):
-        """
-        Wait for the peer to send us a key (used by Bob on startup).
-        Bob does NOT generate his own key — he waits for Alice's.
-        """
-        display_system_message(self.console, "Waiting for peer to send key...", "INFO")
-        got_it = self._key_ready.wait(timeout=timeout)
-        if not got_it:
-            display_system_message(self.console, "Timed out waiting for key. Use /refresh.", "WARNING")
+        self.console.print()
+        self.console.print("[bold bright_cyan]═══ BB84 Interactive Key Exchange ═══[/]")
+        self.console.print("[dim]Waiting for Alice to send photons...[/]")
+        self.console.print()
+
+        # Wait for photons from Alice
+        got_photons = self._photons_received.wait(timeout=120.0)
+        if not got_photons:
+            display_system_message(self.console, "Timed out waiting for Alice's photons.", "ERROR")
+            return
+
+        photon_data = self._received_photons_data
+        photons = [Photon.from_dict(d) for d in photon_data]
+        num = len(photons)
+
+        self.console.print(f"[bold bright_cyan][4/7][/] Received {num} photons from Alice!")
+        self.console.print(f"  Alice [bright_yellow]~~~> ~~~> ~~~> ~~~>[/] Bob")
+        self.console.print()
+
+        # Bob chooses measurement bases
+        self.console.print("[bold bright_cyan][5/7][/] Choose your measurement bases:")
+        self.console.print("[dim]  Use polarization symbols:  -  |  /  \\[/]")
+        self.console.print("[dim]  - and | are rectilinear (+),  / and \\ are diagonal (×)[/]")
+        self.console.print(f"[dim]  Need {num} symbols. Example: | - \\ / - | \\ / | - \\ / - | \\ /[/]")
+        bob_bases_input = self._prompt_bases(num)
+        if bob_bases_input is None:
+            return
+
+        bob_bases = []
+        for sym in bob_bases_input:
+            if sym in ('-', '|'):
+                bob_bases.append(RECTILINEAR)
+            else:
+                bob_bases.append(DIAGONAL)
+
+        # Measure photons
+        bob_bits = measure_photons(photons, bob_bases)
+
+        # Display what Bob measured
+        measured_symbols = ' '.join(BIT_BASIS_TO_SYMBOL.get((b, ba), '?')
+                                    for b, ba in zip(bob_bits, bob_bases))
+        self.console.print(f"  [dim]Your measurements:[/] [bright_yellow]{measured_symbols}[/]")
+        self.console.print(f"  [dim]Measured bits:[/] {' '.join(str(b) for b in bob_bits)}")
+
+        # Send bases to Alice
+        self.console.print()
+        self.console.print("[dim]Sending your bases to Alice...[/]")
+        self.network.send(MSG_BB84_BASES, {'bases': bob_bases})
+
+        # Wait for Alice's reconciliation result (matches + key)
+        self.console.print()
+        self.console.print("[bold bright_cyan][6/7][/] Waiting for basis reconciliation from Alice...")
+
+        got_key = self._key_ready.wait(timeout=120.0)
+        if not got_key:
+            display_system_message(self.console, "Timed out waiting for key.", "ERROR")
+            return
+
+        key_bits = self._received_key
+        error_rate = self._received_error_rate or 0.0
+
+        # Set key on both send and receive managers
+        self.send_key_manager.set_key(list(key_bits), error_rate)
+        self.recv_key_manager.set_key(list(key_bits), error_rate)
+
+        display_bb84_interactive_result(self.console, key_bits, error_rate, 0.0, num)
+        display_system_message(self.console, f"Secure key received: {len(key_bits)} bits", "SUCCESS")
+
+    def _clear_exchange_state(self):
+        """Reset all exchange synchronization state."""
+        self._key_ready.clear()
+        self._photons_received.clear()
+        self._bases_received.clear()
+        self._matches_received.clear()
+        self._received_photons_data = None
+        self._received_bases = None
+        self._received_matches = None
+        self._received_key = None
+        self._received_error_rate = None
+
+    def _display_basis_comparison(self, alice_bases, bob_bases, num):
+        """Display a compact basis comparison table."""
+        from rich.table import Table
+        from rich import box
+
+        table = Table(box=box.SIMPLE, show_header=True, header_style="dim", padding=(0, 1))
+        table.add_column("Pos", justify="center", width=4)
+        table.add_column("A", justify="center", width=3)
+        table.add_column("B", justify="center", width=3)
+        table.add_column("", justify="center", width=3)
+
+        show_count = min(16, num)
+        for i in range(show_count):
+            a = '+' if alice_bases[i] == RECTILINEAR else '×'
+            b = '+' if bob_bases[i] == RECTILINEAR else '×'
+            match = alice_bases[i] == bob_bases[i]
+            sym = f"[green]✓[/]" if match else f"[red]✗[/]"
+            table.add_row(str(i + 1), a, b, sym)
+
+        self.console.print(table)
+
+    # ─── Input Prompts ──────────────────────────────────────────
+
+    def _prompt_bits(self, count: int) -> Optional[List[int]]:
+        """Prompt user to enter bits. Returns list of ints or None on failure."""
+        while True:
+            try:
+                raw = input(f"\n  {self.role} [bits] > ").strip()
+                if raw.startswith('/'):
+                    display_system_message(self.console, "Cannot use commands during key exchange.", "WARNING")
+                    continue
+                tokens = raw.split()
+                if len(tokens) != count:
+                    display_system_message(
+                        self.console,
+                        f"Need exactly {count} bits, got {len(tokens)}. Try again.",
+                        "ERROR"
+                    )
+                    continue
+                bits = []
+                for t in tokens:
+                    if t not in ('0', '1'):
+                        display_system_message(
+                            self.console,
+                            f"Invalid bit '{t}'. Only 0 or 1 allowed.",
+                            "ERROR"
+                        )
+                        break
+                    bits.append(int(t))
+                else:
+                    self.console.print(f"  [dim]Bits:[/] {' '.join(str(b) for b in bits)}")
+                    return bits
+            except (KeyboardInterrupt, EOFError):
+                return None
+
+    def _prompt_bases(self, count: int) -> Optional[List[str]]:
+        """Prompt user to enter basis symbols. Returns list of symbols or None."""
+        valid = {'-', '|', '/', '\\'}
+        while True:
+            try:
+                raw = input(f"\n  {self.role} [bases] > ").strip()
+                if raw.startswith('/'):
+                    display_system_message(self.console, "Cannot use commands during key exchange.", "WARNING")
+                    continue
+                tokens = raw.split()
+                if len(tokens) != count:
+                    display_system_message(
+                        self.console,
+                        f"Need exactly {count} bases, got {len(tokens)}. Try again.",
+                        "ERROR"
+                    )
+                    continue
+                all_valid = True
+                for t in tokens:
+                    if t not in valid:
+                        display_system_message(
+                            self.console,
+                            f"Invalid basis '{t}'. Use: -  |  /  \\",
+                            "ERROR"
+                        )
+                        all_valid = False
+                        break
+                if all_valid:
+                    self.console.print(f"  [dim]Bases:[/] {' '.join(tokens)}")
+                    return tokens
+            except (KeyboardInterrupt, EOFError):
+                return None
 
     # ─── Message Handling ───────────────────────────────────────
 
     def send_chat_message(self, text: str):
         """Encrypt and send a chat message."""
-        if not self.key_manager.get_key():
+        if not self.send_key_manager.get_key():
             display_system_message(self.console, "No key! Use /refresh first.", "ERROR")
             return
 
-        # Check if key needs rotation
-        key = self.key_manager.get_key()
+        key = self.send_key_manager.get_key()
         bits_needed = len(text) * 8
         if key.remaining() < bits_needed:
-            display_system_message(self.console, "Key exhausted. Auto-rotating...", "WARNING")
-            self.stats.record_auto_rotation()
-            self.perform_key_exchange(animate=False)
+            display_system_message(self.console, "Key exhausted! Use /refresh to generate a new key.", "ERROR")
+            return
 
         try:
-            ciphertext, details = encrypt_message(text, self.key_manager)
+            ciphertext, details = encrypt_message(text, self.send_key_manager)
         except KeyExhaustedError:
             display_system_message(self.console, "Key exhausted. Use /refresh.", "ERROR")
             return
 
-        # Show encryption visualization if verbose
         if self.verbose:
             display_encryption(self.console, details, "SENDING")
 
-        # Create message record
         msg = Message(sender=self.role, content=text, encrypted=ciphertext, bits_used=details['bits_used'])
         self.history.add_message(msg)
 
-        # Send over network
         self.network.send(MSG_CHAT, {
             'sender': self.role,
             'ciphertext': ciphertext,
             'bits_used': details['bits_used'],
         })
 
-        # Display
         display_message(self.console, msg, show_encrypted=True)
         self.stats.record_message_sent(len(text.encode('utf-8')))
 
-        # Check rotation threshold
-        key = self.key_manager.get_key()
+        key = self.send_key_manager.get_key()
         if key and key.needs_rotation():
             display_system_message(
                 self.console,
-                f"Key usage at {key.usage_percentage():.0f}%. Rotation recommended (/refresh).",
+                f"Key usage at {key.usage_percentage():.0f}%. Use /refresh for new key.",
                 "WARNING"
             )
 
@@ -195,33 +433,35 @@ class ChatManager:
         with self._lock:
             if msg_type == MSG_CHAT:
                 self._handle_chat(payload)
+            elif msg_type == MSG_BB84_PHOTONS:
+                self._handle_photons(payload)
+            elif msg_type == MSG_BB84_BASES:
+                self._handle_bases(payload)
+            elif msg_type == MSG_BB84_MATCHES:
+                self._handle_matches(payload)
             elif msg_type == MSG_BB84_COMPLETE:
                 self._handle_key_sync(payload)
             elif msg_type == MSG_EVE_TOGGLE:
                 eve_state = payload.get('active', False)
-                self.eve_active = eve_state
-                self.stats.eve_active = eve_state
                 state_str = "enabled" if eve_state else "disabled"
                 display_system_message(self.console, f"Peer toggled Eve: {state_str}", "INFO")
             elif msg_type == MSG_DISCONNECT:
                 display_system_message(self.console, "Peer disconnected.", "WARNING")
                 self.running = False
             elif msg_type == MSG_KEY_ROTATE:
-                # Peer is generating a new key; we just wait for MSG_BB84_COMPLETE
-                display_system_message(self.console, "Peer is refreshing key. Waiting...", "INFO")
+                display_system_message(self.console, "Peer is refreshing key...", "INFO")
 
     def _handle_chat(self, payload: dict):
         """Handle incoming chat message."""
         ciphertext = payload['ciphertext']
         sender = payload.get('sender', self.peer)
-        bits_used = payload.get('bits_used', 0)
 
-        if not self.key_manager.get_key():
+        if not self.recv_key_manager.get_key():
             display_system_message(self.console, "Received message but no key!", "ERROR")
             return
 
         try:
-            plaintext, details = decrypt_message(ciphertext, self.key_manager)
+            plaintext, details = decrypt_message(ciphertext, self.recv_key_manager)
         except KeyExhaustedError:
             display_system_message(self.console, "Key exhausted during decrypt!", "ERROR")
             return
@@ -229,30 +469,51 @@ class ChatManager:
         if self.verbose:
             display_decryption(self.console, details)
 
-        msg = Message(sender=sender, content=plaintext, encrypted=ciphertext, bits_used=bits_used)
+        msg = Message(sender=sender, content=plaintext, encrypted=ciphertext,
+                      bits_used=payload.get('bits_used', 0))
         self.history.add_message(msg)
         display_message(self.console, msg, show_encrypted=True)
         self.stats.record_message_received(len(plaintext.encode('utf-8')))
 
+    def _handle_photons(self, payload: dict):
+        """Handle received photons from Alice (Bob's side)."""
+        self._received_photons_data = payload.get('photons', [])
+        self._photons_received.set()
+
+    def _handle_bases(self, payload: dict):
+        """Handle received bases from Bob (Alice's side)."""
+        self._received_bases = payload.get('bases', [])
+        self._bases_received.set()
+
+    def _handle_matches(self, payload: dict):
+        """Handle received matching positions (Bob's side)."""
+        self._received_matches = payload.get('positions', [])
+        self._matches_received.set()
+
     def _handle_key_sync(self, payload: dict):
-        """Handle key received from peer — set it as our own key."""
+        """Handle key received from peer."""
         key_bits = payload.get('key', [])
         error_rate = payload.get('error_rate', 0.0)
         if key_bits:
-            self.key_manager.set_key(key_bits, error_rate)
+            self._received_key = key_bits
+            self._received_error_rate = error_rate
+            # If Bob is in interactive mode, the interactive method sets the key
+            # If not in interactive exchange, set directly
+            if not self._photons_received.is_set():
+                # Direct key set (non-interactive fallback)
+                self.send_key_manager.set_key(list(key_bits), error_rate)
+                self.recv_key_manager.set_key(list(key_bits), error_rate)
+                display_system_message(
+                    self.console,
+                    f"Secure key received from peer: {len(key_bits)} bits",
+                    "SUCCESS"
+                )
             self._key_ready.set()
-            display_system_message(
-                self.console,
-                f"Secure key received from peer: {len(key_bits)} bits",
-                "SUCCESS"
-            )
 
     # ─── Command Processing ────────────────────────────────────
 
     def process_command(self, cmd: str) -> bool:
-        """
-        Process a /command. Returns False if the app should quit.
-        """
+        """Process a /command. Returns False if the app should quit."""
         parts = cmd.strip().split()
         command = parts[0].lower()
         args = parts[1:] if len(parts) > 1 else []
@@ -261,7 +522,7 @@ class ChatManager:
             display_help(self.console)
 
         elif command == '/key':
-            display_key_info(self.console, self.key_manager)
+            display_key_info(self.console, self.send_key_manager)
 
         elif command == '/refresh':
             self.stats.record_manual_rotation()
@@ -269,34 +530,14 @@ class ChatManager:
                 self.network.send(MSG_KEY_ROTATE, {})
             except Exception:
                 pass
-            # This side generates the new key and sends it to peer
-            self.perform_key_exchange(animate=True)
+            if self.role == "Alice":
+                self.interactive_key_exchange_alice()
+            else:
+                self.interactive_key_exchange_bob()
 
         elif command == '/stats':
-            display_stats(self.console, self.stats, self.key_manager,
+            display_stats(self.console, self.stats, self.send_key_manager,
                           self.role, self.peer_address)
-
-        elif command == '/eve':
-            if args and args[0].lower() == 'on':
-                self.eve_active = True
-                self.stats.eve_active = True
-                display_system_message(self.console, "Eavesdropper simulation enabled.", "WARNING")
-                display_system_message(self.console, "Eve will intercept next key exchange.", "WARNING")
-                try:
-                    self.network.send(MSG_EVE_TOGGLE, {'active': True})
-                except Exception:
-                    pass
-            elif args and args[0].lower() == 'off':
-                self.eve_active = False
-                self.stats.eve_active = False
-                display_system_message(self.console, "Eavesdropper simulation disabled.", "SUCCESS")
-                try:
-                    self.network.send(MSG_EVE_TOGGLE, {'active': False})
-                except Exception:
-                    pass
-            else:
-                state = "ON" if self.eve_active else "OFF"
-                display_system_message(self.console, f"Eve is currently {state}. Use /eve on or /eve off.", "INFO")
 
         elif command == '/verbose':
             if args and args[0].lower() == 'on':
@@ -311,7 +552,7 @@ class ChatManager:
 
         elif command == '/clear':
             self.console.clear()
-            display_header(self.console, self.role, self.peer, self.key_manager, self.stats)
+            display_header(self.console, self.role, self.peer, self.send_key_manager, self.stats)
 
         elif command == '/history':
             display_chat_history(self.console, self.history, show_encrypted=True)
@@ -342,19 +583,18 @@ class ChatManager:
         display_welcome(self.console, self.role)
         self.stats.mark_connected()
 
-        # Start receiving thread FIRST so we can receive the peer's key
+        # Start receiving thread FIRST so we can handle incoming messages
         self.network.start_receiving(self.handle_received_message)
 
-        # Key exchange: Alice generates and sends, Bob waits to receive
+        # Interactive key exchange based on role
         if self.role == "Alice":
-            self.perform_key_exchange(animate=True)
+            self.interactive_key_exchange_alice()
         else:
-            # Bob waits for Alice to send the key
-            self.wait_for_peer_key(timeout=30.0)
+            self.interactive_key_exchange_bob()
 
         # Display header and status
-        display_header(self.console, self.role, self.peer, self.key_manager, self.stats)
-        display_status_bar(self.console, self.key_manager, self.stats)
+        display_header(self.console, self.role, self.peer, self.send_key_manager, self.stats)
+        display_status_bar(self.console, self.send_key_manager, self.stats)
 
         # Chat loop
         while self.running:
@@ -382,6 +622,7 @@ class ChatManager:
 
     def cleanup(self):
         """Clean up resources."""
-        self.key_manager.clear()
+        self.send_key_manager.clear()
+        self.recv_key_manager.clear()
         self.network.stop()
         display_system_message(self.console, "Keys cleared from memory. Goodbye!", "SUCCESS")

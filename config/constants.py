@@ -11,6 +11,22 @@ BASIS_SYMBOLS = {
     DIAGONAL: '×',
 }
 
+# Interactive basis symbols (polarization-style)
+INTERACTIVE_SYMBOLS = {
+    '-': (0, RECTILINEAR),   # 0° horizontal
+    '|': (1, RECTILINEAR),   # 90° vertical
+    '/': (0, DIAGONAL),      # 45° diagonal
+    '\\': (1, DIAGONAL),     # 135° diagonal
+}
+
+# Reverse: (bit, basis) -> interactive symbol
+BIT_BASIS_TO_SYMBOL = {
+    (0, RECTILINEAR): '-',
+    (1, RECTILINEAR): '|',
+    (0, DIAGONAL): '/',
+    (1, DIAGONAL): '\\',
+}
+
 # ─── Polarization Angles ───────────────────────────────────────
 ANGLES = {
     (0, RECTILINEAR): 0,     # bit=0, rectilinear → 0°
@@ -20,10 +36,10 @@ ANGLES = {
 }
 
 ANGLE_SYMBOLS = {
-    0:   '↔',    # horizontal
-    90:  '↕',    # vertical
-    45:  '↗',    # diagonal right
-    135: '↖',    # diagonal left
+    0:   '-',    # horizontal
+    90:  '|',    # vertical
+    45:  '/',    # diagonal right
+    135: '\\',   # diagonal left
 }
 
 # ─── Network Message Types ─────────────────────────────────────

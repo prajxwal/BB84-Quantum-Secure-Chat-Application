@@ -1,20 +1,45 @@
 """
 BB84 Quantum Chat - BB84 Key Exchange Visualization
-Compact IRC-style display for the 7-phase key exchange.
+Compact IRC-style display for the BB84 key exchange.
 """
 
 import time
+from typing import List
 from rich.console import Console
 from rich.table import Table
 from rich import box
 
-from config.constants import BASIS_SYMBOLS, ANGLE_SYMBOLS
+from config.constants import BASIS_SYMBOLS, ANGLE_SYMBOLS, BIT_BASIS_TO_SYMBOL
 from config.settings import ANIMATION_SPEED
 from src.ui.colors import SYMBOLS
 
 
+def display_bb84_interactive_result(console: Console, final_key: List[int],
+                                     error_rate: float, match_rate: float,
+                                     num_photons: int):
+    """Display the result of an interactive BB84 key exchange."""
+    console.print()
+
+    if len(final_key) < 1:
+        console.print(f"[bold red]╔══ ⚠  KEY EXCHANGE FAILED ══╗[/]")
+        console.print(f"[bold red]║[/] No shared key could be established")
+        console.print(f"[bold red]║[/] Try again with /refresh")
+        console.print(f"[bold red]╚═══════════════════════════════════╝[/]")
+    else:
+        from src.crypto.utils import key_to_hex
+        key_hex = key_to_hex(final_key[:64])
+        final_len = len(final_key)
+
+        console.print(f"[bold green]╔══ 🟢 SECURE KEY ESTABLISHED ══╗[/]")
+        console.print(f"[bold green]║[/] Length: {final_len} bits │ Error: {error_rate:.1%}")
+        console.print(f"[bold green]║[/] Key: [dim]{key_hex}[/]")
+        console.print(f"[bold green]╚═══════════════════════════════════╝[/]")
+
+    console.print()
+
+
 def display_bb84_exchange(console: Console, result: dict, animate: bool = True):
-    """Display the BB84 key exchange in compact IRC style."""
+    """Display the BB84 key exchange in compact IRC style (non-interactive/legacy)."""
     delay = ANIMATION_SPEED if animate else 0
     num_photons = len(result['alice_bits'])
 
