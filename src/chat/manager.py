@@ -58,6 +58,7 @@ class ChatManager:
 
         # Synchronization events for interactive BB84
         self._key_ready = threading.Event()
+        self._init_received = threading.Event()     # Alice signals she's starting
         self._photons_received = threading.Event()
         self._bases_received = threading.Event()
         self._matches_received = threading.Event()
@@ -80,29 +81,35 @@ class ChatManager:
         num = INTERACTIVE_NUM_PHOTONS
         self._clear_exchange_state()
 
+        # Signal Bob that we're starting so he can begin waiting
+        try:
+            self.network.send(MSG_BB84_INIT, {'num_photons': num})
+        except Exception:
+            pass
+
         self.console.print()
         self.console.print("[bold bright_cyan]═══ BB84 Interactive Key Exchange ═══[/]")
-        self.console.print(f"[dim]You will prepare {num} photons for Bob.[/]")
+        self.console.print(f"[dim]You will prepare {num} photons for Bob.[/dim]")
         self.console.print()
 
         # Step 1: Alice enters bits
-        self.console.print("[bold bright_cyan][1/7][/] Enter your random bits (0 or 1, space-separated):")
-        self.console.print(f"[dim]  Need {num} bits. Example: 1 0 1 1 0 0 1 0 1 1 0 0 1 0 1 0[/]")
+        self.console.print("[bold bright_cyan]\\[1/7][/] Enter your random bits (0 or 1, space-separated):")
+        self.console.print(f"[dim]  Need {num} bits. Example: 1 0 1 1 0 0 1 0 1 1 0 0 1 0 1 0[/dim]")
         alice_bits = self._prompt_bits(num)
         if alice_bits is None:
             return
 
         # Step 2: Alice enters bases
         self.console.print()
-        self.console.print("[bold bright_cyan][2/7][/] Enter your bases for each bit:")
-        self.console.print("[dim]  Use polarization symbols:  -  |  /  \\[/]")
-        self.console.print("[dim]  - and | are rectilinear (+),  / and \\ are diagonal (×)[/]")
-        self.console.print(f"[dim]  Need {num} symbols. Example: - | / \\ | - / \\ - | / \\ | - / \\[/]")
+        self.console.print("[bold bright_cyan]\\[2/7][/] Enter your bases for each bit:")
+        self.console.print("  [dim]Use polarization symbols:[/dim]  [bold]-[/]  [bold]|[/]  [bold]/[/]  [bold]\\\\[/]")
+        self.console.print("  [dim]- and | are rectilinear,  / and \\\\ are diagonal[/dim]")
+        self.console.print(f"  [dim]Need {num} symbols. Example: - | / \\\\ | - / \\\\ - | / \\\\ | - / \\\\[/dim]")
         alice_bases_input = self._prompt_bases(num)
         if alice_bases_input is None:
             return
 
-        # Parse bases into (bit_for_basis, basis_type) — but we only use the basis_type
+        # Parse bases
         alice_bases = []
         for sym in alice_bases_input:
             if sym in ('-', '|'):
@@ -112,17 +119,21 @@ class ChatManager:
 
         # Step 3: Encode photons
         self.console.print()
-        self.console.print("[bold bright_cyan][3/7][/] Encoding photons...")
+        self.console.print("[bold bright_cyan]\\[3/7][/] Encoding photons...")
         photons = encode_photons(alice_bits, alice_bases)
 
         # Display what Alice prepared
-        polarizations = ' '.join(BIT_BASIS_TO_SYMBOL.get((p.bit, p.basis), '?') for p in photons)
-        self.console.print(f"  [dim]Your photons:[/] [bright_yellow]{polarizations}[/]")
+        pol_list = []
+        for p in photons:
+            sym = BIT_BASIS_TO_SYMBOL.get((p.bit, p.basis), '?')
+            pol_list.append(sym)
+        polarizations = ' '.join(pol_list)
+        self.console.print(f"  [dim]Your photons:[/dim] [bright_yellow]{polarizations}[/]")
 
         # Step 4: Send photons to Bob
         self.console.print()
-        self.console.print("[bold bright_cyan][4/7][/] Transmitting photons to Bob...")
-        self.console.print(f"  Alice [bright_yellow]~~~> ~~~> ~~~> ~~~>[/] Bob")
+        self.console.print("[bold bright_cyan]\\[4/7][/] Transmitting photons to Bob...")
+        self.console.print("  Alice [bright_yellow]~~~> ~~~> ~~~> ~~~>[/] Bob")
 
         photon_data = [p.to_dict() for p in photons]
         try:
@@ -133,8 +144,8 @@ class ChatManager:
 
         # Step 5: Wait for Bob's bases
         self.console.print()
-        self.console.print("[bold bright_cyan][5/7][/] Waiting for Bob to measure photons...")
-        got_bases = self._bases_received.wait(timeout=120.0)
+        self.console.print("[bold bright_cyan]\\[5/7][/] Waiting for Bob to measure photons...")
+        got_bases = self._bases_received.wait(timeout=300.0)
         if not got_bases:
             display_system_message(self.console, "Timed out waiting for Bob's bases.", "ERROR")
             return
@@ -143,11 +154,11 @@ class ChatManager:
         bob_bases_symbols = ' '.join(
             '+' if b == RECTILINEAR else '×' for b in bob_bases
         )
-        self.console.print(f"  [dim]Bob's bases:[/] [bright_magenta]{bob_bases_symbols}[/]")
+        self.console.print(f"  [dim]Bob's bases:[/dim] [bright_magenta]{bob_bases_symbols}[/]")
 
         # Step 6: Reconciliation
         self.console.print()
-        self.console.print("[bold bright_cyan][6/7][/] Basis reconciliation...")
+        self.console.print("[bold bright_cyan]\\[6/7][/] Basis reconciliation...")
         matching_positions = find_matching_positions(alice_bases, bob_bases)
         match_rate = len(matching_positions) / num
 
@@ -157,8 +168,8 @@ class ChatManager:
         match_preview = ', '.join(str(p + 1) for p in matching_positions[:10])
         if len(matching_positions) > 10:
             match_preview += '...'
-        self.console.print(f"  [dim]Matching positions:[/] [green]{match_preview}[/]")
-        self.console.print(f"  [dim]Match rate:[/] {match_rate:.1%} ({len(matching_positions)}/{num})")
+        self.console.print(f"  [dim]Matching positions:[/dim] [green]{match_preview}[/]")
+        self.console.print(f"  [dim]Match rate:[/dim] {match_rate:.1%} ({len(matching_positions)}/{num})")
 
         # Send matching positions to Bob
         self.network.send(MSG_BB84_MATCHES, {
@@ -171,13 +182,11 @@ class ChatManager:
 
         # Step 7: Error checking
         self.console.print()
-        self.console.print("[bold bright_cyan][7/7][/] Error checking...")
+        self.console.print("[bold bright_cyan]\\[7/7][/] Error checking...")
 
         error_rate, sample_positions, alice_sample, bob_sample = check_errors(
-            alice_raw_key, alice_raw_key  # No error in local — we check with Bob's key via network
+            alice_raw_key, alice_raw_key
         )
-        # Since we only have Alice's bits locally, error rate is 0 for alice-only check
-        # The real comparison is done by checking if Bob got the same bits at matching positions
 
         alice_final_key = remove_sample_bits(alice_raw_key, sample_positions)
 
@@ -211,7 +220,7 @@ class ChatManager:
     def interactive_key_exchange_bob(self):
         """
         Bob's side of the interactive BB84 key exchange.
-        Bob waits for photons, enters his measurement bases,
+        Bob waits for init signal, then photons, enters his measurement bases,
         measures, sends bases back, waits for the final key.
         """
         num = INTERACTIVE_NUM_PHOTONS
@@ -219,11 +228,12 @@ class ChatManager:
 
         self.console.print()
         self.console.print("[bold bright_cyan]═══ BB84 Interactive Key Exchange ═══[/]")
-        self.console.print("[dim]Waiting for Alice to send photons...[/]")
+        self.console.print("[dim]Waiting for Alice to prepare photons...[/dim]")
+        self.console.print("[dim](Alice is entering her bits and bases)[/dim]")
         self.console.print()
 
-        # Wait for photons from Alice
-        got_photons = self._photons_received.wait(timeout=120.0)
+        # Wait for photons from Alice (long timeout since Alice is typing manually)
+        got_photons = self._photons_received.wait(timeout=600.0)
         if not got_photons:
             display_system_message(self.console, "Timed out waiting for Alice's photons.", "ERROR")
             return
@@ -232,15 +242,15 @@ class ChatManager:
         photons = [Photon.from_dict(d) for d in photon_data]
         num = len(photons)
 
-        self.console.print(f"[bold bright_cyan][4/7][/] Received {num} photons from Alice!")
-        self.console.print(f"  Alice [bright_yellow]~~~> ~~~> ~~~> ~~~>[/] Bob")
+        self.console.print(f"[bold bright_cyan]\\[4/7][/] Received {num} photons from Alice!")
+        self.console.print("  Alice [bright_yellow]~~~> ~~~> ~~~> ~~~>[/] Bob")
         self.console.print()
 
         # Bob chooses measurement bases
-        self.console.print("[bold bright_cyan][5/7][/] Choose your measurement bases:")
-        self.console.print("[dim]  Use polarization symbols:  -  |  /  \\[/]")
-        self.console.print("[dim]  - and | are rectilinear (+),  / and \\ are diagonal (×)[/]")
-        self.console.print(f"[dim]  Need {num} symbols. Example: | - \\ / - | \\ / | - \\ / - | \\ /[/]")
+        self.console.print("[bold bright_cyan]\\[5/7][/] Choose your measurement bases:")
+        self.console.print("  [dim]Use polarization symbols:[/dim]  [bold]-[/]  [bold]|[/]  [bold]/[/]  [bold]\\\\[/]")
+        self.console.print("  [dim]- and | are rectilinear,  / and \\\\ are diagonal[/dim]")
+        self.console.print(f"  [dim]Need {num} symbols. Example: | - \\\\ / - | \\\\ / | - \\\\ / - | \\\\ /[/dim]")
         bob_bases_input = self._prompt_bases(num)
         if bob_bases_input is None:
             return
@@ -256,21 +266,24 @@ class ChatManager:
         bob_bits = measure_photons(photons, bob_bases)
 
         # Display what Bob measured
-        measured_symbols = ' '.join(BIT_BASIS_TO_SYMBOL.get((b, ba), '?')
-                                    for b, ba in zip(bob_bits, bob_bases))
-        self.console.print(f"  [dim]Your measurements:[/] [bright_yellow]{measured_symbols}[/]")
-        self.console.print(f"  [dim]Measured bits:[/] {' '.join(str(b) for b in bob_bits)}")
+        measured_list = []
+        for b, ba in zip(bob_bits, bob_bases):
+            sym = BIT_BASIS_TO_SYMBOL.get((b, ba), '?')
+            measured_list.append(sym)
+        measured_symbols = ' '.join(measured_list)
+        self.console.print(f"  [dim]Your measurements:[/dim] [bright_yellow]{measured_symbols}[/]")
+        self.console.print(f"  [dim]Measured bits:[/dim] {' '.join(str(b) for b in bob_bits)}")
 
         # Send bases to Alice
         self.console.print()
-        self.console.print("[dim]Sending your bases to Alice...[/]")
+        self.console.print("[dim]Sending your bases to Alice...[/dim]")
         self.network.send(MSG_BB84_BASES, {'bases': bob_bases})
 
         # Wait for Alice's reconciliation result (matches + key)
         self.console.print()
-        self.console.print("[bold bright_cyan][6/7][/] Waiting for basis reconciliation from Alice...")
+        self.console.print("[bold bright_cyan]\\[6/7][/] Waiting for basis reconciliation from Alice...")
 
-        got_key = self._key_ready.wait(timeout=120.0)
+        got_key = self._key_ready.wait(timeout=300.0)
         if not got_key:
             display_system_message(self.console, "Timed out waiting for key.", "ERROR")
             return
@@ -288,6 +301,7 @@ class ChatManager:
     def _clear_exchange_state(self):
         """Reset all exchange synchronization state."""
         self._key_ready.clear()
+        self._init_received.clear()
         self._photons_received.clear()
         self._bases_received.clear()
         self._matches_received.clear()
@@ -313,7 +327,7 @@ class ChatManager:
             a = '+' if alice_bases[i] == RECTILINEAR else '×'
             b = '+' if bob_bases[i] == RECTILINEAR else '×'
             match = alice_bases[i] == bob_bases[i]
-            sym = f"[green]✓[/]" if match else f"[red]✗[/]"
+            sym = "[green]✓[/]" if match else "[red]✗[/]"
             table.add_row(str(i + 1), a, b, sym)
 
         self.console.print(table)
@@ -347,7 +361,7 @@ class ChatManager:
                         break
                     bits.append(int(t))
                 else:
-                    self.console.print(f"  [dim]Bits:[/] {' '.join(str(b) for b in bits)}")
+                    self.console.print(f"  [dim]Bits:[/dim] {' '.join(str(b) for b in bits)}")
                     return bits
             except (KeyboardInterrupt, EOFError):
                 return None
@@ -374,13 +388,13 @@ class ChatManager:
                     if t not in valid:
                         display_system_message(
                             self.console,
-                            f"Invalid basis '{t}'. Use: -  |  /  \\",
+                            f"Invalid basis '{t}'. Use:  -  |  /  \\\\",
                             "ERROR"
                         )
                         all_valid = False
                         break
                 if all_valid:
-                    self.console.print(f"  [dim]Bases:[/] {' '.join(tokens)}")
+                    self.console.print(f"  [dim]Bases:[/dim] {' '.join(tokens)}")
                     return tokens
             except (KeyboardInterrupt, EOFError):
                 return None
@@ -433,6 +447,8 @@ class ChatManager:
         with self._lock:
             if msg_type == MSG_CHAT:
                 self._handle_chat(payload)
+            elif msg_type == MSG_BB84_INIT:
+                self._handle_init(payload)
             elif msg_type == MSG_BB84_PHOTONS:
                 self._handle_photons(payload)
             elif msg_type == MSG_BB84_BASES:
@@ -449,7 +465,12 @@ class ChatManager:
                 display_system_message(self.console, "Peer disconnected.", "WARNING")
                 self.running = False
             elif msg_type == MSG_KEY_ROTATE:
-                display_system_message(self.console, "Peer is refreshing key...", "INFO")
+                display_system_message(self.console, "Peer is starting new key exchange...", "INFO")
+                # Bob should start his interactive exchange
+                if self.role == "Bob":
+                    self._clear_exchange_state()
+                    # Signal that we should start waiting for photons
+                    # (handled in the main thread via a flag)
 
     def _handle_chat(self, payload: dict):
         """Handle incoming chat message."""
@@ -475,6 +496,10 @@ class ChatManager:
         display_message(self.console, msg, show_encrypted=True)
         self.stats.record_message_received(len(plaintext.encode('utf-8')))
 
+    def _handle_init(self, payload: dict):
+        """Handle BB84 init signal from Alice (Bob's side)."""
+        self._init_received.set()
+
     def _handle_photons(self, payload: dict):
         """Handle received photons from Alice (Bob's side)."""
         self._received_photons_data = payload.get('photons', [])
@@ -497,10 +522,8 @@ class ChatManager:
         if key_bits:
             self._received_key = key_bits
             self._received_error_rate = error_rate
-            # If Bob is in interactive mode, the interactive method sets the key
-            # If not in interactive exchange, set directly
+            # If Bob is NOT in interactive exchange, set key directly
             if not self._photons_received.is_set():
-                # Direct key set (non-interactive fallback)
                 self.send_key_manager.set_key(list(key_bits), error_rate)
                 self.recv_key_manager.set_key(list(key_bits), error_rate)
                 display_system_message(
