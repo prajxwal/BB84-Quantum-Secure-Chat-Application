@@ -32,6 +32,10 @@ class Client:
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.socket.settimeout(CONNECTION_TIMEOUT)
                 self.socket.connect((self.host, self.port))
+                # Remove timeout after connecting — receive thread blocks
+                # until data arrives, preventing it from dying during
+                # long interactive BB84 exchanges.
+                self.socket.settimeout(None)
                 self.running = True
                 return True
             except (ConnectionRefusedError, socket.timeout, OSError):
@@ -66,6 +70,9 @@ class Client:
                 msg_type, payload, seq = recv_message(self.socket)
                 if self._on_message:
                     self._on_message(msg_type, payload, seq)
+            except socket.timeout:
+                # Timeout is fine — just retry
+                continue
             except (ProtocolError, ConnectionError, OSError):
                 if self.running:
                     self.running = False

@@ -152,7 +152,7 @@ class ChatManager:
 
         bob_bases = self._received_bases
         bob_bases_symbols = ' '.join(
-            '+' if b == RECTILINEAR else '×' for b in bob_bases
+            '- |' if b == RECTILINEAR else '/ \\' for b in bob_bases
         )
         self.console.print(f"  [dim]Bob's bases:[/dim] [bright_magenta]{bob_bases_symbols}[/]")
 
@@ -318,14 +318,14 @@ class ChatManager:
 
         table = Table(box=box.SIMPLE, show_header=True, header_style="dim", padding=(0, 1))
         table.add_column("Pos", justify="center", width=4)
-        table.add_column("A", justify="center", width=3)
-        table.add_column("B", justify="center", width=3)
+        table.add_column("A", justify="center", width=5)
+        table.add_column("B", justify="center", width=5)
         table.add_column("", justify="center", width=3)
 
         show_count = min(16, num)
         for i in range(show_count):
-            a = '+' if alice_bases[i] == RECTILINEAR else '×'
-            b = '+' if bob_bases[i] == RECTILINEAR else '×'
+            a = '- |' if alice_bases[i] == RECTILINEAR else '/ \\'
+            b = '- |' if bob_bases[i] == RECTILINEAR else '/ \\'
             match = alice_bases[i] == bob_bases[i]
             sym = "[green]✓[/]" if match else "[red]✗[/]"
             table.add_row(str(i + 1), a, b, sym)
@@ -436,6 +436,9 @@ class ChatManager:
         display_message(self.console, msg, show_encrypted=True)
         self.stats.record_message_sent(len(text.encode('utf-8')))
 
+        # Refresh status bar to show updated key usage / message count
+        display_status_bar(self.console, self.send_key_manager, self.stats)
+
         key = self.send_key_manager.get_key()
         if key and key.needs_rotation():
             display_system_message(
@@ -497,6 +500,9 @@ class ChatManager:
         self.history.add_message(msg)
         display_message(self.console, msg, show_encrypted=True)
         self.stats.record_message_received(len(plaintext.encode('utf-8')))
+
+        # Refresh status bar to show updated key usage / message count
+        display_status_bar(self.console, self.recv_key_manager, self.stats)
 
     def _handle_init(self, payload: dict):
         """Handle BB84 init signal from Alice (Bob's side)."""

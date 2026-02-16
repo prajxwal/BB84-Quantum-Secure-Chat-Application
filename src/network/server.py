@@ -34,7 +34,10 @@ class Server:
     def accept_connection(self) -> tuple:
         """Wait for and accept a client connection."""
         self.client_socket, self.client_address = self.server_socket.accept()
-        self.client_socket.settimeout(CONNECTION_TIMEOUT)
+        # No timeout — receive thread blocks until data arrives.
+        # This prevents the receive thread from dying during long
+        # interactive BB84 exchanges where users type manually.
+        self.client_socket.settimeout(None)
         return self.client_address
 
     def send(self, msg_type: int, payload: Any):
@@ -61,6 +64,9 @@ class Server:
                 msg_type, payload, seq = recv_message(self.client_socket)
                 if self._on_message:
                     self._on_message(msg_type, payload, seq)
+            except socket.timeout:
+                # Timeout is fine — just retry
+                continue
             except (ProtocolError, ConnectionError, OSError):
                 if self.running:
                     self.running = False
